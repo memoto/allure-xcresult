@@ -28,19 +28,21 @@ enum Allure2Converter {
         let historyId = historyIDProvider.makeHistoryID(testCase: testCase)
 
         do {
+            let allureProcessingResult = processAllureAnnotations(testCase: testCase)
+            
             let test = try TestResult(
                 uuid: uuid,
                 historyId: historyId,
-                testCaseId: nil,
+                testCaseId: allureProcessingResult.testCaseId,
                 testCaseName: nil,
                 fullName: testCase.summary.identifier,
-                labels: Self.makeLabels(for: testCase),
-                links: Self.makeAllureLinks(for: testCase),
-                name: testCase.summary.name,
+                labels: allureProcessingResult.labels,
+                links: allureProcessingResult.links,
+                name: allureProcessingResult.name ?? testCase.summary.name,
                 status: Self.makeStatus(for: testCase.summary),
                 statusDetails: statusDetails,
                 stage: nil,
-                description: nil,
+                description: allureProcessingResult.description,
                 descriptionHtml: nil,
                 steps: steps,
                 attachments: [],
@@ -75,7 +77,7 @@ extension Allure2Converter {
     }
 
     private static func makeStep(from activity: TestActivity) -> StepResult? {
-        if activity.isAllureLabel || activity.isAllureLink {
+        if activity.isAllureAnnotation {
             return nil
         }
 
@@ -110,10 +112,23 @@ extension Allure2Converter {
             stop: activity.endedTime?.millis ?? activity.startedTime?.millis ?? 0
         )
     }
-
-    private static func makeLabels(for testCase: TestCase) -> [Label] {
+    
+    private struct AllureProcessingResult {
+        let labels: [Label]
+        let links: [Link]
+        let name: String?
+        let description: String?
+        let testCaseId: String?
+    }
+    
+    private static func processAllureAnnotations(testCase: TestCase) -> AllureProcessingResult {
         var labels: [String: [String]] = [:]
+        var links: [Link] = []
+        var testName: String?
+        var testDescription: String?
+        var testCaseId: String?
 
+        // Add default labels
         if let parentSuite = testCase.summary.path.first {
             labels["parentSuite"] = [parentSuite]
         }
@@ -126,73 +141,159 @@ extension Allure2Converter {
         + " on \(testCase.destination.machineIdentifier)"
         labels["host"] = [hostValue]
 
-        let allureLabels = extractAllureLabels(from: testCase.activities)
+        // Process allure annotations from activities
+        for activity in testCase.activities {
+            processAllureAnnotationsRecursively(activity: activity, 
+                                               labels: &labels, 
+                                               links: &links, 
+                                               testName: &testName, 
+                                               testDescription: &testDescription, 
+                                               testCaseId: &testCaseId)
+        }
 
-        return labels
-            .merging(allureLabels) { _, rhs in rhs }
-            .flatMap { key, values in
-                values.map { Label(name: key, value: $0) }
-            }
+        let labelArray = labels.flatMap { key, values in
+            values.map { Label(name: key, value: $0) }
+        }
+
+        return AllureProcessingResult(
+            labels: labelArray,
+            links: links,
+            name: testName,
+            description: testDescription,
+            testCaseId: testCaseId
+        )
     }
+    
+    private static func processAllureAnnotationsRecursively(
+        activity: TestActivity,
+        labels: inout [String: [String]],
+        links: inout [Link],
+        testName: inout String?,
+        testDescription: inout String?,
+        testCaseId: inout String?
+    ) {
+        // Process current activity
+        if let allureId = activity.allureId {
+            testCaseId = allureId
+            labels["AS_ID"] = [allureId]
+        } else if let name = activity.allureName {
+            testName = name
+        } else if let description = activity.allureDescription {
+            testDescription = description
+        } else if let (key, value) = activity.allureLabel {
+            labels[key, default: []].append(value)
+        } else if let link = activity.allureLink {
+            links.append(Link(name: link.name, url: link.url, type: link.type))
+        }
 
-    private static func extractAllureLabels(from activities: [TestActivity]) -> [String: [String]] {
-        activities
-            .filter { $0.isAllureLabel }
-            .reduce(into: [String: [String]]()) { result, activity in
-                guard let (key, value) = activity.allureLabel else { return }
-                result[key, default: []].append(value)
-            }
-    }
-
-    private static func makeAllureLinks(for testCase: TestCase) -> [Link] {
-        testCase
-            .activities
-            .compactMap { activity in
-                guard let (name, type, url) = activity.allureLink else { return nil }
-                return Link(name: name, url: url, type: type)
-            }
+        // Process subactivities recursively
+        for subactivity in activity.subactivities {
+            processAllureAnnotationsRecursively(
+                activity: subactivity,
+                labels: &labels,
+                links: &links,
+                testName: &testName,
+                testDescription: &testDescription,
+                testCaseId: &testCaseId
+            )
+        }
     }
 }
 
 extension TestActivity {
-    private static let allureLabelPrefix = "allure_label_"
-    private static let allureLinkPrefix = "allure_link_"
+    private static let allureIdPrefix = "allure.id:"
+    private static let allureNamePrefix = "allure.name:"
+    private static let allureDescriptionPrefix = "allure.description:"
+    private static let allureLabelPrefix = "allure.label."
+    private static let allureLinkPrefix = "allure.link."
+    
+    // Legacy prefixes for backward compatibility
+    private static let legacyAllureLabelPrefix = "allure_label_"
+    private static let legacyAllureLinkPrefix = "allure_link_"
+
+    var isAllureAnnotation: Bool {
+        title.hasPrefix(Self.allureIdPrefix) ||
+        title.hasPrefix(Self.allureNamePrefix) ||
+        title.hasPrefix(Self.allureDescriptionPrefix) ||
+        title.hasPrefix(Self.allureLabelPrefix) ||
+        title.hasPrefix(Self.allureLinkPrefix) ||
+        title.hasPrefix(Self.legacyAllureLabelPrefix) ||
+        title.hasPrefix(Self.legacyAllureLinkPrefix)
+    }
 
     var isAllureLabel: Bool {
-        title.hasPrefix(Self.allureLabelPrefix)
+        title.hasPrefix(Self.allureLabelPrefix) || title.hasPrefix(Self.legacyAllureLabelPrefix)
     }
 
     var isAllureLink: Bool {
-        title.hasPrefix(Self.allureLinkPrefix)
+        title.hasPrefix(Self.allureLinkPrefix) || title.hasPrefix(Self.legacyAllureLinkPrefix)
     }
 
+    var allureId: String? {
+        guard title.hasPrefix(Self.allureIdPrefix) else { return nil }
+        return String(title.dropFirst(Self.allureIdPrefix.count))
+    }
+
+    var allureName: String? {
+        guard title.hasPrefix(Self.allureNamePrefix) else { return nil }
+        return String(title.dropFirst(Self.allureNamePrefix.count))
+    }
+
+    var allureDescription: String? {
+        guard title.hasPrefix(Self.allureDescriptionPrefix) else { return nil }
+        return String(title.dropFirst(Self.allureDescriptionPrefix.count))
+    }
 
     var allureLabel: (key: String, value: String)? {
-        guard isAllureLabel else { return nil }
-
-        let components = title
-            .dropFirst(Self.allureLabelPrefix.count)
-            .split(separator: "_", maxSplits: 1)
-
-        guard components.count == 2 else { return nil }
-
-        return (String(components[0]), String(components[1]))
+        if title.hasPrefix(Self.allureLabelPrefix) {
+            let content = title.dropFirst(Self.allureLabelPrefix.count)
+            guard let colonIndex = content.firstIndex(of: ":") else { return nil }
+            let key = String(content[..<colonIndex])
+            let value = String(content[content.index(after: colonIndex)...])
+            return (key, value.trimmingCharacters(in: .whitespaces))
+        } else if title.hasPrefix(Self.legacyAllureLabelPrefix) {
+            // Legacy format: allure_label_key_value
+            let components = title
+                .dropFirst(Self.legacyAllureLabelPrefix.count)
+                .split(separator: "_", maxSplits: 1)
+            
+            guard components.count == 2 else { return nil }
+            return (String(components[0]), String(components[1]))
+        }
+        return nil
     }
 
     var allureLink: (name: String, type: String, url: String)? {
-        guard isAllureLink else { return nil }
+        if title.hasPrefix(Self.allureLinkPrefix) {
+            let content = title.dropFirst(Self.allureLinkPrefix.count)
+            
+            // Parse pattern: allure.link.{name}[{type}]:{url}
+            let regex = try! NSRegularExpression(pattern: #"^(.+?)(?:\[(.+?)\])?:(.+)$"#)
+            let nsString = NSString(string: String(content))
+            guard let match = regex.firstMatch(in: String(content), options: [], range: NSRange(location: 0, length: nsString.length)) else {
+                return nil
+            }
+            
+            let name = nsString.substring(with: match.range(at: 1))
+            let type = match.range(at: 2).location != NSNotFound ? nsString.substring(with: match.range(at: 2)) : ""
+            let url = nsString.substring(with: match.range(at: 3)).trimmingCharacters(in: .whitespaces)
+            
+            return (name, type, url)
+        } else if title.hasPrefix(Self.legacyAllureLinkPrefix) {
+            // Legacy format: allure_link_name_type_url
+            let components = title
+                .dropFirst(Self.legacyAllureLinkPrefix.count)
+                .split(separator: "_", maxSplits: 2)
 
-        let components = title
-            .dropFirst(Self.allureLinkPrefix.count)
-            .split(separator: "_", maxSplits: 2)
+            guard components.count == 3 else { return nil }
 
-        guard components.count == 3 else { return nil }
-
-        return (
-            name: String(components[0]),
-            type: String(components[1]),
-            url: String(components[2])
-        )
+            return (
+                name: String(components[0]),
+                type: String(components[1]),
+                url: String(components[2])
+            )
+        }
+        return nil
     }
 }
 
